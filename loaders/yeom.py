@@ -6,22 +6,25 @@
 This is the PRIMARY Rung-1 dataset: cued, event-timed movement execution with 4
 reach directions, directly downloadable (unlike HCP), loadable with plain scipy.
 
-Dataset structure (verify on first run -- printed by this loader):
-  - epoched `.mat` per subject/session = a MATLAB cell array of 4 cells, one per
-    reach direction; each cell is `channels x time x trials`.
-  - 319 channels: 1-306 MEG (102 magnetometers + 204 planar gradiometers),
-    307-315 triggers, 316 EOG, 317-319 accelerometer.
+Dataset structure (the real files are MATLAB v7.3 -> read via mat73):
+  - top-level `epoched_data` = a 4-cell array (one per reach direction); each cell
+    is `channels x time x trials`. Plus an `info` dict = the MNE-Python measurement
+    info (ch_names, sfreq, ...).
+  - 319 channels: 306 MEG (102 magnetometers + 204 planar gradiometers),
+    plus triggers, EOG and accelerometer.
   - ~30 trials/direction/session; window -1..+2 s from cue onset; sfreq 600.615 Hz.
 
 Returns the standard contract:
   X (n_trials, n_channels, n_times) float32, y (n_trials,) int, sfreq, class_names
 
-CAVEAT (channel selection): MEGIN/Vectorview orders sensors in triplets per
-location, so the magnetometer indices within the 1-306 block are an assumption
-here (default 2::3). sensor_type="all" (the default) sidesteps this and is barely
-more expensive because the temporal pipeline -- not the channel count -- dominates
-compute. Use "mag"/"grad" only after confirming the ordering against the dataset's
-channel names, or pass an explicit `mag_idx`.
+CHANNEL SELECTION: magnetometers/gradiometers are identified from the file's MNE
+`info` ch_names (MEGIN convention: last digit 1 = magnetometer, 2/3 = planar
+gradiometer), so sensor_type "all"/"mag"/"grad" are EXACT on the real Yeom files
+(306/102/204), and sfreq is taken from `info`. Files lacking an info dict (e.g.
+synthetic mocks) fall back to a positional guess (mags at 2::3); pass an explicit
+`mag_idx` to force the indices. (Note: classical CSP/band-power decode reach
+*direction* poorly -- it is not a beta-ERD effect -- so the conv->transformer is
+the decoder that works here.)
 """
 import os
 import glob
@@ -81,6 +84,46 @@ def _sensor_indices(sensor_type, n_meg, mag_idx):
     raise ValueError(f"sensor_type must be all/mag/grad, got {sensor_type!r}")
 
 
+def _info_dict(mat):
+    """The nested MNE info dict, if present (mat73 dict or scipy mat_struct)."""
+    info = mat.get("info") if isinstance(mat, dict) else None
+    if info is None:
+        return None
+    if isinstance(info, dict):
+        return info.get("info", info)      # mat73: real info is nested under 'info'
+    return getattr(info, "info", info)     # scipy mat_struct
+
+
+def _meg_channel_index(mat):
+    """Classify MEG channels from info['ch_names'] using the MEGIN naming convention
+    (last digit 1 = magnetometer, 2/3 = planar gradiometer). Returns
+    {'all','mag','grad': index arrays into the channel axis} or None if unavailable."""
+    info = _info_dict(mat)
+    ch_names = info.get("ch_names") if isinstance(info, dict) else getattr(info, "ch_names", None)
+    if ch_names is None or len(ch_names) == 0:
+        return None
+    meg, mag, grad = [], [], []
+    for i, name in enumerate(ch_names):
+        c = str(name).replace(" ", "")
+        if c.upper().startswith("MEG") and c[-1:] in ("1", "2", "3"):
+            meg.append(i)
+            (mag if c[-1] == "1" else grad).append(i)
+    if not meg:
+        return None
+    return {"all": np.array(meg), "mag": np.array(mag), "grad": np.array(grad)}
+
+
+def _info_sfreq(mat):
+    info = _info_dict(mat)
+    if info is None:
+        return None
+    v = info.get("sfreq") if isinstance(info, dict) else getattr(info, "sfreq", None)
+    try:
+        return float(np.ravel(v)[0]) if v is not None else None
+    except Exception:
+        return None
+
+
 def load_yeom(data_path, subject=None, session=None, sensor_type="all",
               classes=None, tmin=-1.0, tmax=2.0, crop=None, resample=None,
               n_meg=306, mag_idx=None, sfreq=600.615, seed=0):
@@ -116,13 +159,23 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
     if len({s[0] for s in shapes}) != 1 or len({s[1] for s in shapes}) != 1:
         raise RuntimeError(f"direction cells disagree on channels/time: {shapes}")
 
-    sel = _sensor_indices(sensor_type, n_meg, mag_idx)
+    # channel selection: prefer the MNE info ch_names (authoritative), else positional
+    chan = None if mag_idx is not None else _meg_channel_index(mat)
+    if chan is not None:
+        if sensor_type not in chan:
+            raise ValueError(f"sensor_type must be all/mag/grad, got {sensor_type!r}")
+        sel, sel_src = chan[sensor_type], "info"
+    else:
+        sel, sel_src = _sensor_indices(sensor_type, n_meg, mag_idx), "positional"
+
+    # sampling rate: prefer the value stored in the file's info
+    isf = _info_sfreq(mat)
+    if isf is not None:
+        sfreq = isf
 
     X_list, y_list = [], []
     for new_label, d in enumerate(keep):
-        arr = cells[d]                               # (channels, time, trials)
-        arr = arr[:n_meg]                            # drop trigger/EOG/accel
-        arr = arr[sel]                               # select sensor subset
+        arr = cells[d][sel]                          # select MEG channels (absolute idx)
         trials = np.transpose(arr, (2, 0, 1))        # -> (trials, channels, time)
         X_list.append(trials)
         y_list.append(np.full(trials.shape[0], new_label, dtype=int))
@@ -146,6 +199,6 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
     perm = np.random.default_rng(seed).permutation(len(y))
     X, y = X[perm], y[perm]
 
-    print(f"[yeom] {X.shape[0]} trials | {X.shape[1]} channels ({sensor_type}) | "
+    print(f"[yeom] {X.shape[0]} trials | {X.shape[1]} channels ({sensor_type}, {sel_src}) | "
           f"{X.shape[2]} samples | sfreq={sfreq:.1f} Hz | classes {class_names}")
     return X, y, float(sfreq), class_names

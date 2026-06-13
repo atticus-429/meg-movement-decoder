@@ -67,10 +67,10 @@ look right (4 classes, ~30 trials each) before trusting accuracy.
 
 - **v7.3 `.mat`**: if `scipy.io.loadmat` errors, `pip install mat73` (the loader
   falls back to it automatically).
-- **Channel selection**: `--sensor-type all` (default, 306 ch) is unambiguous and
-  barely costs more than mag-only here. `--sensor-type mag`/`grad` assume MEGIN
-  triplet ordering (mags at `2::3`) — verify against the dataset's channel names
-  first, or pass an explicit `mag_idx` in code.
+- **Channel selection**: mag/grad are identified from the file's MNE `info`
+  channel names, so `--sensor-type all` (306) / `mag` (102) / `grad` (204) are all
+  exact. (CSP/band-power decode reach *direction* poorly regardless — it's not a
+  beta-ERD effect — so the `convtransformer` is the decoder that works here.)
 - **Direction labels** are positional (`dir0..dir3`); confirm the physical
   direction mapping from the dataset docs before claiming *what* is decoded.
 - **sfreq** is hard-coded to 600.615 Hz (the epoched `.mat` may not store it);
