@@ -1,0 +1,16 @@
+# Core pipeline (synthetic smoke test + classical decoders)
+numpy
+scipy
+scikit-learn
+mne>=1.0
+
+# Optional: deep decoders (EEGNet + conv->transformer)
+torch
+
+# Yeom 3D-reaching branch (loaders/yeom.py): scipy only; optional reader for
+# v7.3/HDF5 .mat files (loader auto-falls back to it):
+mat73
+
+# Real HCP-data branch only (loaders/hcp.py):
+mne-hcp          # provides the importable `hcp` module
+boto3            # for scripted S3 download (or use the AWS CLI instead)

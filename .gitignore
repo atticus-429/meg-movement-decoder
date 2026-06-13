@@ -1,0 +1,5 @@
+hcp_data/
+yeom_data/
+*.npz
+__pycache__/
+.ipynb_checkpoints/
