@@ -124,9 +124,43 @@ def _info_sfreq(mat):
         return None
 
 
+def _accel_indices(mat):
+    """Indices of the 3 accelerometer channels (by name), or None."""
+    info = _info_dict(mat)
+    ch_names = info.get("ch_names") if isinstance(info, dict) else getattr(info, "ch_names", None)
+    if not ch_names:
+        return None
+    idx = [i for i, n in enumerate(ch_names) if "accel" in str(n).lower()]
+    return np.array(idx) if idx else None
+
+
+def _detect_movement_onset(accel, sfreq, tmin, k=4.0, min_dur=0.03, search_start=0.0):
+    """Per-trial movement onset (sample index) from a (n_axes, T) accelerometer trace.
+    Detrend each axis by the pre-cue baseline (removes the gravity offset), take the
+    Euclidean magnitude, and return the first sustained crossing of
+    baseline_mean + k*baseline_std at/after `search_start` s. None if no crossing."""
+    T = accel.shape[1]
+    t = tmin + np.arange(T) / sfreq
+    base = t < 0.0
+    if base.sum() < 5:
+        base = t < (t.min() + 0.2)
+    detr = accel - accel[:, base].mean(axis=1, keepdims=True)
+    mag = np.sqrt((detr ** 2).sum(axis=0))
+    thr = mag[base].mean() + k * (mag[base].std() + 1e-12)
+    cand = np.where((mag > thr) & (t >= search_start))[0]
+    if len(cand) == 0:
+        return None
+    md = max(int(min_dur * sfreq), 1)
+    for i in cand:
+        if i + md <= T and (mag[i:i + md] > thr).all():
+            return int(i)
+    return int(cand[0])
+
+
 def load_yeom(data_path, subject=None, session=None, sensor_type="all",
               classes=None, tmin=-1.0, tmax=2.0, crop=None, resample=None,
-              n_meg=306, mag_idx=None, sfreq=600.615, seed=0):
+              n_meg=306, mag_idx=None, sfreq=600.615, seed=0,
+              align="cue", onset_k=4.0):
     # --- resolve the .mat file -------------------------------------------------
     if os.path.isdir(data_path):
         # recursive so zip-extracted nested folders (e.g. on Colab/Drive) are found
@@ -173,21 +207,50 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
     if isf is not None:
         sfreq = isf
 
-    X_list, y_list = [], []
-    for new_label, d in enumerate(keep):
-        arr = cells[d][sel]                          # select MEG channels (absolute idx)
-        trials = np.transpose(arr, (2, 0, 1))        # -> (trials, channels, time)
-        X_list.append(trials)
-        y_list.append(np.full(trials.shape[0], new_label, dtype=int))
-    X = np.concatenate(X_list, axis=0).astype(np.float32)
-    y = np.concatenate(y_list, axis=0)
-
-    # --- optional crop (seconds, relative to tmin) ----------------------------
-    if crop is not None:
-        lo = int(round((crop[0] - tmin) * sfreq))
-        hi = int(round((crop[1] - tmin) * sfreq))
-        lo, hi = max(lo, 0), min(hi, X.shape[2])
-        X = X[:, :, lo:hi]
+    if align == "movement":
+        # --- accelerometer-gated: per-trial window relative to MOVEMENT onset ---
+        acc_idx = _accel_indices(mat)
+        if acc_idx is None:
+            raise RuntimeError("align='movement' needs accelerometer channels, "
+                               "none found in info ch_names")
+        win = crop if crop is not None else (-0.5, 0.0)   # seconds, relative to onset
+        w0, w1 = int(round(win[0] * sfreq)), int(round(win[1] * sfreq))
+        X_list, y_list, onset_s, n_drop = [], [], [], 0
+        for new_label, d in enumerate(keep):
+            cell = cells[d]                                # (319, T, n_trials)
+            meg, acc = cell[sel], cell[acc_idx]
+            for tr in range(cell.shape[2]):
+                onset = _detect_movement_onset(acc[:, :, tr], sfreq, tmin, k=onset_k)
+                if onset is None or onset + w0 < 0 or onset + w1 > cell.shape[1]:
+                    n_drop += 1
+                    continue
+                X_list.append(meg[:, onset + w0:onset + w1, tr])   # (n_meg, win)
+                y_list.append(new_label)
+                onset_s.append(tmin + onset / sfreq)
+        if not X_list:
+            raise RuntimeError("no trials survived accel-gating; relax onset_k or the window")
+        X = np.stack(X_list).astype(np.float32)            # (n_kept, n_meg, win)
+        y = np.array(y_list, dtype=int)
+        onset_s = np.array(onset_s)
+        print(f"[yeom] accel-gated PRE-movement: kept {len(y)}/{len(y)+n_drop} trials | "
+              f"onset median {1000*np.median(onset_s):.0f} ms post-cue "
+              f"(IQR {1000*np.percentile(onset_s,25):.0f}-{1000*np.percentile(onset_s,75):.0f}) | "
+              f"window {win[0]:+.2f}..{win[1]:+.2f}s rel. onset")
+    else:
+        # --- cue-locked: single fixed window for every trial --------------------
+        X_list, y_list = [], []
+        for new_label, d in enumerate(keep):
+            arr = cells[d][sel]                          # select MEG channels (absolute idx)
+            trials = np.transpose(arr, (2, 0, 1))        # -> (trials, channels, time)
+            X_list.append(trials)
+            y_list.append(np.full(trials.shape[0], new_label, dtype=int))
+        X = np.concatenate(X_list, axis=0).astype(np.float32)
+        y = np.concatenate(y_list, axis=0)
+        if crop is not None:                             # seconds, relative to tmin (cue)
+            lo = int(round((crop[0] - tmin) * sfreq))
+            hi = int(round((crop[1] - tmin) * sfreq))
+            lo, hi = max(lo, 0), min(hi, X.shape[2])
+            X = X[:, :, lo:hi]
 
     # --- optional anti-aliased downsample -------------------------------------
     if resample is not None and abs(resample - sfreq) > 1e-6:

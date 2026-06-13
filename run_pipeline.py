@@ -63,6 +63,10 @@ def parse_args():
     p.add_argument("--crop", nargs=2, type=float, default=None,
                    metavar=("LO", "HI"), help="crop window in seconds")
     p.add_argument("--resample", type=float, default=None, help="downsample to this Hz")
+    p.add_argument("--align", choices=["cue", "movement"], default="cue",
+                   help="cue=fixed window from cue onset; movement=accel-gated pre-movement window")
+    p.add_argument("--onset-k", type=float, default=4.0,
+                   help="accel onset threshold (baseline_mean + k*std) for --align movement")
     p.add_argument("--out", default=None, help="optional .npz path to save results")
     return p.parse_args()
 
@@ -88,7 +92,7 @@ def load_data(args):
                          session=args.session, sensor_type=args.sensor_type,
                          classes=yeom_classes,
                          crop=tuple(args.crop) if args.crop else None,
-                         resample=args.resample)
+                         resample=args.resample, align=args.align, onset_k=args.onset_k)
 
 
 def main():
