@@ -21,11 +21,17 @@ no data-use agreement** (CC-BY 4.0).
 
 ## On Colab (recommended for training)
 
-Use **`colab_runner.ipynb`** — it mounts Drive, downloads only the subject you
-need straight from figshare (via HTTP range requests, ~0.5–1 GB instead of the
-full 9.3 GB), and trains on the GPU. The figshare files are single ~9.3 GB zips
-(`ica` file id `41898840`, `epoched` `41898714`); the notebook lists the archive
-and extracts just your subject's `.mat` to Drive.
+Use **`colab_runner.ipynb`** — it mounts Drive, downloads the figshare archive
+(one ~9.3 GB zip per variant: `ica` file id `41898840`, `epoched` `41898714`) to
+fast local disk, extracts just your subject's `.mat` (~0.5 GB, named
+`Sub_<n>_ses_<s>_ICA.mat`, n=1..9, s=1..2) to Drive, then trains on the GPU. The
+`.mat` are MATLAB **v7.3**, so the notebook installs `mat73` to read them; the
+code is cloned from the **public** repo (no token).
+
+> Note: figshare download URLs expire after ~10 s, which makes selective
+> (`remotezip`) extraction very slow (~13 min/subject). The notebook therefore
+> downloads the full archive with `wget -c` (full speed, resumable) and extracts
+> your subject — `remotezip` is kept only as an optional, off-by-default cell.
 
 ## Get it manually
 

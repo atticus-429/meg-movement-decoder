@@ -58,10 +58,10 @@ For the real Yeom reaching data (4 directions), see `download_yeom.md`, then e.g
 ### Train on Colab (GPU)
 
 `colab_runner.ipynb` is a ready-to-run Colab notebook that **mounts Google Drive →
-downloads the Yeom dataset to Drive (only the subject you need, via HTTP range
-requests) → loads from Drive → trains the conv→transformer on the GPU** (full
-5-fold CV becomes practical there). Set the runtime to GPU and either upload the
-`hcp_motor_decoder/` folder to Drive or point it at your git repo.
+downloads the Yeom archive and extracts your subject to Drive → loads from Drive →
+trains the conv→transformer on the GPU** (full 5-fold CV becomes practical there).
+Set the runtime to GPU; the code is cloned from the public repo (no token needed).
+The Yeom `.mat` are MATLAB v7.3, so the notebook installs `mat73` to read them.
 
 ### Verified synthetic results (seed 0, 5-fold CV, 160 trials)
 
