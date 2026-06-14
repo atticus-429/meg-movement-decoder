@@ -155,7 +155,12 @@ class TorchConvTransformer(BaseEstimator, ClassifierMixin):
                  d_model=128, n_heads=4, n_layers=3, ff_mult=4,
                  pool="attention", dropout=0.2,
                  n_epochs=60, lr=1e-3, weight_decay=1e-4, batch_size=32,
-                 device="auto", max_seq_len=2048, class_weight=True, seed=0):
+                 device="auto", max_seq_len=2048, class_weight=True, seed=0,
+                 # --- Tier-1 regularization (all OFF by default -> default
+                 #     pipeline is byte-for-byte unchanged; opt in per-arg) ---
+                 label_smoothing=0.0, lr_schedule="none", warmup_frac=0.1,
+                 early_stopping=False, val_frac=0.2, patience=15, min_epochs=10,
+                 noise_std=0.0, time_jitter=0, channel_drop=0.0, mixup_alpha=0.0):
         # store every arg verbatim (clone-safe); no derived state here
         self.sfreq = sfreq
         self.n_spatial = n_spatial
@@ -178,6 +183,18 @@ class TorchConvTransformer(BaseEstimator, ClassifierMixin):
         self.max_seq_len = max_seq_len
         self.class_weight = class_weight
         self.seed = seed
+        # Tier-1 knobs (generalizable; no Yeom-specific tuning)
+        self.label_smoothing = label_smoothing   # soft targets in CE
+        self.lr_schedule = lr_schedule           # "none" | "cosine" (warmup+decay)
+        self.warmup_frac = warmup_frac           # cosine warmup as frac of steps
+        self.early_stopping = early_stopping     # hold out val_frac, keep best
+        self.val_frac = val_frac
+        self.patience = patience                 # epochs w/o val improvement
+        self.min_epochs = min_epochs             # never stop before this
+        self.noise_std = noise_std               # additive Gaussian (z-units)
+        self.time_jitter = time_jitter           # +/- samples circular shift
+        self.channel_drop = channel_drop         # frac of channels zeroed/sample
+        self.mixup_alpha = mixup_alpha           # Beta(a,a) mixup; 0 = off
 
     def _build(self, n_channels, n_classes):
         import torch
@@ -255,9 +272,42 @@ class TorchConvTransformer(BaseEstimator, ClassifierMixin):
 
         return Net()
 
+    def _augment(self, x, y, g):
+        """Per-batch augmentation (training only). Returns (x, y_a, y_b, lam):
+        lam is None unless mixup is active, in which case the caller mixes the
+        loss as lam*CE(out,y_a) + (1-lam)*CE(out,y_b). All ops no-op when their
+        hyperparameter is 0/off, so the default path is untouched."""
+        import torch
+        y_a, y_b, lam = y, y, None
+        if self.noise_std and self.noise_std > 0:
+            x = x + self.noise_std * torch.randn(x.shape, generator=g,
+                                                 device=x.device, dtype=x.dtype)
+        if self.time_jitter and self.time_jitter > 0:          # circular shift
+            B, C, T = x.shape
+            ms = int(self.time_jitter)
+            shifts = torch.randint(-ms, ms + 1, (B,), generator=g, device=x.device)
+            ar = torch.arange(T, device=x.device)
+            idx = (ar.unsqueeze(0) - shifts.unsqueeze(1)) % T   # (B, T)
+            x = torch.gather(x, 2, idx.unsqueeze(1).expand(B, C, T))
+        if self.channel_drop and self.channel_drop > 0:
+            B, C, _ = x.shape
+            keep = (torch.rand(B, C, 1, generator=g, device=x.device)
+                    >= self.channel_drop).to(x.dtype)
+            x = x * keep / (1.0 - self.channel_drop)            # keep expectation
+        if self.mixup_alpha and self.mixup_alpha > 0:
+            a = float(self.mixup_alpha)
+            lam = float(torch.distributions.Beta(a, a).sample())
+            lam = max(lam, 1.0 - lam)                           # label stays nearer y_a
+            perm = torch.randperm(x.shape[0], generator=g, device=x.device)
+            x = lam * x + (1.0 - lam) * x[perm]
+            y_b = y[perm]
+        return x, y_a, y_b, lam
+
     def fit(self, X, y):
         import torch
         torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
         if self.device == "auto":
             self.device_ = "cuda" if torch.cuda.is_available() else "cpu"
         else:
@@ -274,31 +324,90 @@ class TorchConvTransformer(BaseEstimator, ClassifierMixin):
 
         self.net_ = self._build(X.shape[1], n_classes).to(self.device_)
 
-        xb = torch.tensor(Xn)                            # (N, C, T)
-        yb = torch.tensor(y_idx, dtype=torch.long)
+        xb_all = torch.tensor(Xn)                        # (N, C, T) on CPU
+        yb_all = torch.tensor(y_idx, dtype=torch.long)
+
+        # optional stratified validation split for early stopping (opt-in)
+        va = None
+        if self.early_stopping and self.val_frac and self.val_frac > 0:
+            try:
+                from sklearn.model_selection import train_test_split
+                tr, va = train_test_split(np.arange(len(y_idx)),
+                                          test_size=self.val_frac, stratify=y_idx,
+                                          random_state=self.seed)
+            except Exception:                            # too few per class -> skip
+                tr, va = np.arange(len(y_idx)), None
+        else:
+            tr = np.arange(len(y_idx))
+        xb, yb = xb_all[tr], yb_all[tr]
 
         if self.class_weight:
-            counts = np.bincount(y_idx, minlength=n_classes).astype(np.float32)
+            counts = np.bincount(yb.numpy(), minlength=n_classes).astype(np.float32)
             w = counts.sum() / (n_classes * np.maximum(counts, 1.0))
             weight = torch.tensor(w, dtype=torch.float32, device=self.device_)
         else:
             weight = None
-        lossf = torch.nn.CrossEntropyLoss(weight=weight)
+        lossf = torch.nn.CrossEntropyLoss(weight=weight,
+                                          label_smoothing=self.label_smoothing)
         opt = torch.optim.AdamW(self.net_.parameters(), lr=self.lr,
                                 weight_decay=self.weight_decay)
 
-        n = len(y_idx)
+        n = len(yb)
+        steps_per_epoch = max(1, (n + self.batch_size - 1) // self.batch_size)
+        total_steps = steps_per_epoch * self.n_epochs
+        if self.lr_schedule == "cosine":
+            warmup = max(1, int(self.warmup_frac * total_steps))
+
+            def lr_lambda(step):
+                if step < warmup:
+                    return (step + 1) / warmup
+                prog = (step - warmup) / max(1, total_steps - warmup)
+                return float(0.5 * (1.0 + np.cos(np.pi * min(prog, 1.0))))
+
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        else:
+            sched = None
+
         rng = np.random.default_rng(self.seed)
-        self.net_.train()
-        for _ in range(self.n_epochs):
+        g = torch.Generator(device=self.device_)
+        g.manual_seed(int(self.seed))
+        best_val, best_state, bad = np.inf, None, 0
+        for epoch in range(self.n_epochs):
+            self.net_.train()
             perm = rng.permutation(n)
             for s in range(0, n, self.batch_size):
                 idx = perm[s:s + self.batch_size]
+                xbatch = xb[idx].to(self.device_)
+                ybatch = yb[idx].to(self.device_)
+                xbatch, y_a, y_b, lam = self._augment(xbatch, ybatch, g)
                 opt.zero_grad()
-                out = self.net_(xb[idx].to(self.device_))
-                loss = lossf(out, yb[idx].to(self.device_))
+                out = self.net_(xbatch)
+                if lam is None:
+                    loss = lossf(out, y_a)
+                else:
+                    loss = lam * lossf(out, y_a) + (1.0 - lam) * lossf(out, y_b)
                 loss.backward()
                 opt.step()
+                if sched is not None:
+                    sched.step()
+            # early stopping on held-out val loss (keep best weights)
+            if va is not None and (epoch + 1) >= self.min_epochs:
+                self.net_.eval()
+                with torch.no_grad():
+                    vout = self.net_(xb_all[va].to(self.device_))
+                    vloss = torch.nn.functional.cross_entropy(
+                        vout, yb_all[va].to(self.device_), weight=weight,
+                        label_smoothing=self.label_smoothing).item()
+                if vloss < best_val - 1e-4:
+                    best_val, bad = vloss, 0
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in self.net_.state_dict().items()}
+                else:
+                    bad += 1
+                    if bad >= self.patience:
+                        break
+        if best_state is not None:
+            self.net_.load_state_dict(best_state)
         return self
 
     def predict(self, X):
@@ -317,8 +426,11 @@ class TorchConvTransformer(BaseEstimator, ClassifierMixin):
 # Factory
 # --------------------------------------------------------------------------- #
 def build_decoder(name, sfreq, beta_band=(13.0, 30.0), mu_band=(8.0, 13.0),
-                  n_csp=6):
+                  n_csp=6, **kwargs):
     name = name.lower()
+    if name != "convtransformer" and kwargs:
+        raise ValueError(f"extra decoder kwargs {list(kwargs)} are only supported "
+                         f"for convtransformer, not '{name}'")
     if name == "csp":
         import mne
         from mne.decoding import CSP
@@ -337,6 +449,6 @@ def build_decoder(name, sfreq, beta_band=(13.0, 30.0), mu_band=(8.0, 13.0),
     if name == "eegnet":
         return TorchEEGNet(sfreq=sfreq)
     if name == "convtransformer":
-        return TorchConvTransformer(sfreq=sfreq)
+        return TorchConvTransformer(sfreq=sfreq, **kwargs)
     raise ValueError(f"unknown decoder '{name}' "
                      f"(choose csp / bandpower / eegnet / convtransformer)")

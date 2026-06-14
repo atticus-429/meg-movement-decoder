@@ -70,6 +70,10 @@ def parse_args():
                    help="cue=fixed window from cue onset; movement=accel-gated pre-movement window")
     p.add_argument("--onset-k", type=float, default=4.0,
                    help="accel onset threshold (baseline_mean + k*std) for --align movement")
+    p.add_argument("--tier1", action="store_true",
+                   help="enable the Tier-1 regularization preset for convtransformer "
+                        "(cosine LR+warmup, label smoothing, early stopping, light "
+                        "augmentation); generalizable, no dataset-specific tuning")
     p.add_argument("--out", default=None, help="optional .npz path to save results")
     return p.parse_args()
 
@@ -120,8 +124,22 @@ def main():
     counts = {class_names[c]: int((y == c).sum()) for c in range(n_classes)}
     print(f"Class counts: {counts}")
 
+    dec_kwargs = {}
+    if args.tier1:
+        if args.decoder != "convtransformer":
+            print(f"[warn] --tier1 only affects convtransformer; "
+                  f"ignoring for decoder={args.decoder}")
+        else:
+            # generalizable regularization preset (not Yeom-tuned)
+            dec_kwargs = dict(lr_schedule="cosine", warmup_frac=0.1,
+                              label_smoothing=0.1, early_stopping=True,
+                              val_frac=0.2, patience=15,
+                              noise_std=0.1, time_jitter=3,
+                              channel_drop=0.1, mixup_alpha=0.2)
+            print(f"[tier1] convtransformer regularization preset: {dec_kwargs}")
     decoder = build_decoder(args.decoder, sfreq=sfreq,
-                            beta_band=config.BETA_BAND, mu_band=config.MU_BAND)
+                            beta_band=config.BETA_BAND, mu_band=config.MU_BAND,
+                            **dec_kwargs)
 
     # Held-out predictions. kfold = every trial held out once (analogous to the
     # parent repo's "HeldOutTrials"); holdout = one split so a torch decoder
