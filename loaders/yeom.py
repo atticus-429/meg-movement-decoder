@@ -232,7 +232,7 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
         X = np.stack(X_list).astype(np.float32)            # (n_kept, n_meg, win)
         y = np.array(y_list, dtype=int)
         onset_s = np.array(onset_s)
-        print(f"[yeom] accel-gated PRE-movement: kept {len(y)}/{len(y)+n_drop} trials | "
+        print(f"[yeom] accel-gated movement-onset window: kept {len(y)}/{len(y)+n_drop} trials | "
               f"onset median {1000*np.median(onset_s):.0f} ms post-cue "
               f"(IQR {1000*np.percentile(onset_s,25):.0f}-{1000*np.percentile(onset_s,75):.0f}) | "
               f"window {win[0]:+.2f}..{win[1]:+.2f}s rel. onset")

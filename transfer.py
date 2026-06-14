@@ -80,21 +80,63 @@ def _load_pretrained(model, path):
 # --------------------------------------------------------------------------- #
 # the experiment
 # --------------------------------------------------------------------------- #
-def pretrain_then_calibrate(subjects, build_fn, K_per_class_list=(0, 5, 10, 20, 30),
+def _calibrate_sweep(model, pre_state, pre_mean, pre_std, Xpool, ypool, Xte, yte,
+                     build_fn, K_per_class_list, finetune_lr, finetune_epochs,
+                     seed, held, unit, verbose):
+    """Pretrained `model` cached in pre_state/pre_mean/pre_std. Sweep calibration
+    budget K over (Xpool,ypool), test on the fixed (Xte,yte). Rows: zeroshot (K=0)
+    + full/frozen/scratch per K>0. Restores the pristine pretrained state first so
+    this is reusable across units of the same held subject."""
+    rows = []
+    # K=0 zero-shot: pristine pretrained model (weights + PRETRAIN standardization)
+    model.net_.load_state_dict(pre_state)
+    model.mean_, model.std_ = pre_mean, pre_std
+    a, l, h = _acc_ci(yte, model.predict(Xte), seed=seed)
+    rows.append(dict(held=held, unit=unit, K=0, n_cal=0, variant="zeroshot",
+                     acc=a, ci_lo=l, ci_hi=h))
+    if verbose:
+        print(f"[{held}/{unit}] K=0  zeroshot {a:.1f}%", flush=True)
+    for K in [k for k in K_per_class_list if k > 0]:
+        idx = _stratified_sample(ypool, K, seed=seed)
+        Xc, yc = Xpool[idx], ypool[idx]
+        model.net_.load_state_dict(pre_state)
+        model.finetune(Xc, yc, lr=finetune_lr, n_epochs=finetune_epochs, freeze_trunk=False)
+        accA = _acc_ci(yte, model.predict(Xte), seed=seed)
+        model.net_.load_state_dict(pre_state)
+        model.finetune(Xc, yc, lr=finetune_lr, n_epochs=finetune_epochs, freeze_trunk=True)
+        accC = _acc_ci(yte, model.predict(Xte), seed=seed)
+        scratch = build_fn(); scratch.fit(Xc, yc)
+        accS = _acc_ci(yte, scratch.predict(Xte), seed=seed)
+        for variant, (a, l, h) in [("full", accA), ("frozen", accC), ("scratch", accS)]:
+            rows.append(dict(held=held, unit=unit, K=K, n_cal=int(len(yc)),
+                             variant=variant, acc=a, ci_lo=l, ci_hi=h))
+        if verbose:
+            print(f"[{held}/{unit}] K={K} ({len(yc)} cal):  full {accA[0]:.1f}  "
+                  f"frozen {accC[0]:.1f}  scratch {accS[0]:.1f}", flush=True)
+    return rows
+
+
+def pretrain_then_calibrate(subjects, build_fn, K_per_class_list=(0, 5, 10, 20),
+                            protocol="within_session", test_per_class=10,
                             seed=0, finetune_lr=1e-4, finetune_epochs=30,
                             save_dir=None, verbose=True):
     """subjects: dict name -> {'ses1': (X, y), 'ses2': (X, y)} (same class set).
-    build_fn: () -> a fresh TorchConvTransformer (carries hyperparams).
-    Returns a list of result-row dicts (held, K, n_cal, variant, acc, ci_lo, ci_hi).
+    build_fn: () -> a fresh TorchConvTransformer.
+    protocol:
+      'within_session' (default; the realistic BCI case -- recalibrate each
+        session): per target session, hold out test_per_class/class as a FIXED
+        test set, calibrate on K/class from the rest, test within the SAME session.
+      'cross_session' (stretch goal -- calibrate once, use another day):
+        calibrate on the target's session 1, test on session 2.
+    The held-out subject is always absent from pretraining; test is disjoint from
+    calibration. Returns a list of result-row dicts.
     """
     names = sorted(subjects)
     rows = []
     for held in names:
         others = [s for s in names if s != held]
-        Xtr = np.concatenate([subjects[s][ses][0] for s in others
-                              for ses in subjects[s]])
-        ytr = np.concatenate([subjects[s][ses][1] for s in others
-                              for ses in subjects[s]])
+        Xtr = np.concatenate([subjects[s][ses][0] for s in others for ses in subjects[s]])
+        ytr = np.concatenate([subjects[s][ses][1] for s in others for ses in subjects[s]])
 
         # ---- pretrain on the other subjects (cache for resume) ----
         ckpt = os.path.join(save_dir, f"pretrain_wo_{held}.pt") if save_dir else None
@@ -111,43 +153,24 @@ def pretrain_then_calibrate(subjects, build_fn, K_per_class_list=(0, 5, 10, 20, 
             if ckpt:
                 _save_pretrained(model, ckpt, Xtr.shape[1])
         pre_state = copy.deepcopy(model.net_.state_dict())
+        pre_mean, pre_std = model.mean_.copy(), model.std_.copy()
 
-        Xcal, ycal = subjects[held]["ses1"]      # calibration source
-        Xte, yte = subjects[held]["ses2"]        # held-out test (never calibrated on)
-
-        # ---- K=0 : zero-shot ----
-        a, l, h = _acc_ci(yte, model.predict(Xte), seed=seed)
-        rows.append(dict(held=held, K=0, n_cal=0, variant="zeroshot",
-                         acc=a, ci_lo=l, ci_hi=h))
-        if verbose:
-            print(f"[{held}] K=0  zeroshot {a:.1f}%", flush=True)
-
-        # ---- K>0 : full (A) / frozen (C) / scratch ----
-        for K in [k for k in K_per_class_list if k > 0]:
-            cal_idx = _stratified_sample(ycal, K, seed=seed)
-            Xc, yc = Xcal[cal_idx], ycal[cal_idx]
-
-            model.net_.load_state_dict(pre_state)
-            model.finetune(Xc, yc, lr=finetune_lr, n_epochs=finetune_epochs,
-                           freeze_trunk=False)
-            accA = _acc_ci(yte, model.predict(Xte), seed=seed)
-
-            model.net_.load_state_dict(pre_state)
-            model.finetune(Xc, yc, lr=finetune_lr, n_epochs=finetune_epochs,
-                           freeze_trunk=True)
-            accC = _acc_ci(yte, model.predict(Xte), seed=seed)
-
-            scratch = build_fn()
-            scratch.fit(Xc, yc)
-            accS = _acc_ci(yte, scratch.predict(Xte), seed=seed)
-
-            for variant, (a, l, h) in [("full", accA), ("frozen", accC),
-                                       ("scratch", accS)]:
-                rows.append(dict(held=held, K=K, n_cal=int(len(yc)),
-                                 variant=variant, acc=a, ci_lo=l, ci_hi=h))
-            if verbose:
-                print(f"[{held}] K={K} ({len(yc)} cal):  full {accA[0]:.1f}  "
-                      f"frozen {accC[0]:.1f}  scratch {accS[0]:.1f}", flush=True)
+        if protocol == "cross_session":
+            Xpool, ypool = subjects[held]["ses1"]
+            Xte, yte = subjects[held]["ses2"]
+            rows += _calibrate_sweep(model, pre_state, pre_mean, pre_std, Xpool, ypool,
+                                     Xte, yte, build_fn, K_per_class_list, finetune_lr,
+                                     finetune_epochs, seed, held, "xses", verbose)
+        else:  # within_session: per session, fixed held-out test
+            for ses in sorted(subjects[held]):
+                X, y = subjects[held][ses]
+                te_idx = _stratified_sample(y, test_per_class, seed=seed + 1)
+                mask = np.ones(len(y), bool); mask[te_idx] = False
+                Xte, yte = X[te_idx], y[te_idx]
+                Xpool, ypool = X[mask], y[mask]
+                rows += _calibrate_sweep(model, pre_state, pre_mean, pre_std, Xpool, ypool,
+                                         Xte, yte, build_fn, K_per_class_list, finetune_lr,
+                                         finetune_epochs, seed, held, ses, verbose)
     return rows
 
 
@@ -200,7 +223,8 @@ def _smoke():
             sfreq=sf, n_spatial=32, conv_dim=32, d_model=32, n_heads=2,
             n_layers=1, n_conv_blocks=2, n_epochs=15, batch_size=16, seed=0)
 
-    rows = pretrain_then_calibrate(subjects, build_fn, K_per_class_list=(0, 10, 20),
+    rows = pretrain_then_calibrate(subjects, build_fn, K_per_class_list=(0, 5, 10),
+                                   protocol="within_session", test_per_class=5,
                                    finetune_lr=1e-3, finetune_epochs=15, seed=0)
     summ = summarize(rows)
     print("\n--- mean over subjects (acc%) ---")
