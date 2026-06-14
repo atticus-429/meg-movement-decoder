@@ -174,6 +174,78 @@ def pretrain_then_calibrate(subjects, build_fn, K_per_class_list=(0, 5, 10, 20),
     return rows
 
 
+def cross_window_transfer(subjects, build_fn, split_sample=None,
+                          K_per_class_list=(0, 5, 10, 20), test_per_class=10,
+                          include_others_strong=False, seed=0,
+                          finetune_lr=1e-4, finetune_epochs=30,
+                          save_dir=None, verbose=True):
+    """Cross-WINDOW transfer to lift the weak PRE window using the strong DURING
+    window. subjects: name -> {ses: (X_full, y)} where X_full spans the COMBINED
+    movement-onset window [-0.5,+0.5]s -- the early half is PRE (planning), the late
+    half is DURING (execution); split at split_sample (default T//2). Both halves
+    have the same shape so one model fits both.
+
+    Per subject/session: split trials into CAL and TEST (stratified, TEST =
+    test_per_class/class); PRETRAIN the feature-extractor on the DURING half of CAL
+    trials (+ all OTHER subjects' DURING if include_others_strong); then calibrate on
+    the PRE half of CAL trials (K/class) and test on the PRE half of TEST trials.
+    Reuses _calibrate_sweep -> rows carry zeroshot/full/frozen/scratch per K, where
+    scratch = PRE-only baseline and zeroshot = DURING-pretrained, no PRE calibration.
+    No leakage: TEST trials' slices (either window) never enter pretrain or calibrate.
+    """
+    names = sorted(subjects)
+    rows = []
+    for held in names:
+        others_X = others_y = None
+        if include_others_strong:
+            ox, oy = [], []
+            for s in names:
+                if s == held:
+                    continue
+                for ses in subjects[s]:
+                    Xf, yy = subjects[s][ses]
+                    sp = (Xf.shape[2] // 2) if split_sample is None else split_sample
+                    ox.append(Xf[:, :, sp:]); oy.append(yy)            # DURING half
+            others_X, others_y = np.concatenate(ox), np.concatenate(oy)
+
+        for ses in sorted(subjects[held]):
+            Xf, y = subjects[held][ses]
+            sp = (Xf.shape[2] // 2) if split_sample is None else split_sample
+            pre, during = Xf[:, :, :sp], Xf[:, :, sp:]
+            te_idx = _stratified_sample(y, test_per_class, seed=seed + 1)
+            mask = np.ones(len(y), bool); mask[te_idx] = False
+            pre_te, y_te = pre[te_idx], y[te_idx]
+            pre_pool, y_pool = pre[mask], y[mask]
+            dur_pool = during[mask]                                    # CAL trials' DURING
+
+            if include_others_strong:
+                Xs = np.concatenate([others_X, dur_pool])
+                ys = np.concatenate([others_y, y_pool])
+            else:
+                Xs, ys = dur_pool, y_pool
+
+            ckpt = os.path.join(save_dir, f"xwin_{held}_{ses}.pt") if save_dir else None
+            model = build_fn()
+            if ckpt and os.path.exists(ckpt):
+                _load_pretrained(model, ckpt)
+                if verbose:
+                    print(f"[{held}/{ses}] loaded DURING-pretrain checkpoint", flush=True)
+            else:
+                if verbose:
+                    print(f"[{held}/{ses}] pretrain on DURING ({len(ys)} trials"
+                          f"{', +others' if include_others_strong else ''})...", flush=True)
+                model.fit(Xs, ys)
+                if ckpt:
+                    _save_pretrained(model, ckpt, Xs.shape[1])
+            pre_state = copy.deepcopy(model.net_.state_dict())
+            pre_mean, pre_std = model.mean_.copy(), model.std_.copy()
+
+            rows += _calibrate_sweep(model, pre_state, pre_mean, pre_std, pre_pool, y_pool,
+                                     pre_te, y_te, build_fn, K_per_class_list, finetune_lr,
+                                     finetune_epochs, seed, held, ses, verbose)
+    return rows
+
+
 def summarize(rows):
     """Mean accuracy per (K, variant) across held-out subjects -> dict."""
     out = {}
@@ -246,5 +318,52 @@ def _smoke():
     print("SMOKE OK")
 
 
+def _make_xwin_subjects(n_subjects=4, n_channels=32, sfreq=150.0, seed=0):
+    """Combined-window synthetic subjects for the cross-window smoke: one
+    [-0.5,+0.5]s window per (subject, session), sliced 50/50 into PRE | DURING."""
+    from loaders.synthetic import make_synthetic_motor
+    rng = np.random.default_rng(seed)
+    subjects, sf = {}, sfreq
+    for s in range(n_subjects):
+        M = np.eye(n_channels) + 0.3 * rng.standard_normal((n_channels, n_channels)) / np.sqrt(n_channels)
+        gain = np.exp(0.2 * rng.standard_normal((n_channels, 1)))
+        d = {}
+        for ses, sd in (("ses1", 10 * s + 1), ("ses2", 10 * s + 2)):
+            X, y, sf, _ = make_synthetic_motor(
+                n_trials_per_class=20, n_channels=n_channels, sfreq=sfreq,
+                tmin=-0.5, tmax=0.5, classes=("LH", "RH", "LF", "RF"), seed=sd)
+            X = (np.einsum("ij,njt->nit", M, X) * gain[None]).astype(np.float32)
+            d[ses] = (X, y)
+        subjects[f"S{s}"] = d
+    return subjects, sf
+
+
+def _smoke_xwin():
+    from decode import TorchConvTransformer
+    subjects, sf = _make_xwin_subjects(n_subjects=4, n_channels=32, seed=0)
+    print("\n[cross-window smoke] subjects:", list(subjects),
+          "| X_full:", subjects["S0"]["ses1"][0].shape)
+
+    def build_fn():
+        return TorchConvTransformer(
+            sfreq=sf, n_spatial=32, conv_dim=32, d_model=32, n_heads=2,
+            n_layers=1, n_conv_blocks=2, n_epochs=15, batch_size=16, seed=0)
+
+    rows = cross_window_transfer(subjects, build_fn, K_per_class_list=(0, 5, 10),
+                                 test_per_class=5, include_others_strong=False,
+                                 finetune_lr=1e-3, finetune_epochs=15, seed=0)
+    summ = summarize(rows)
+    print("--- cross-window mean over subjects (acc%) ---")
+    print(f"{'K':>3}  {'zeroshot':>9} {'full':>7} {'frozen':>7} {'scratch':>8}")
+    for K in sorted({k for k, _ in summ}):
+        def g(v):
+            return f"{summ[(K, v)][0]:.1f}" if (K, v) in summ else "  -"
+        print(f"{K:>3}  {g('zeroshot'):>9} {g('full'):>7} {g('frozen'):>7} {g('scratch'):>8}")
+    variants = {v for (_, v) in summ}
+    assert {"zeroshot", "full", "frozen", "scratch"} <= variants, variants
+    print("XWIN SMOKE OK")
+
+
 if __name__ == "__main__":
     _smoke()
+    _smoke_xwin()
