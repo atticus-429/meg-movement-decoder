@@ -38,7 +38,8 @@ from evaluate import (error_rate, bootstrap_error_ci, format_confusion,
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", choices=["synthetic", "hcp", "yeom"], default="synthetic")
+    p.add_argument("--source", choices=["synthetic", "hcp", "yeom", "rathee"],
+                   default="synthetic")
     p.add_argument("--decoder",
                    choices=["csp", "bandpower", "eegnet", "convtransformer"],
                    default="csp")
@@ -57,6 +58,8 @@ def parse_args():
     p.add_argument("--subject", default="100307")
     # yeom options
     p.add_argument("--yeom-path", default="./yeom_data")
+    p.add_argument("--rathee-path", default="./rathee_bids",
+                   help="BIDS root for the Rathee MEG-imagery dataset")
     p.add_argument("--session", default=None)
     p.add_argument("--sensor-type", choices=["mag", "grad", "all"], default="all",
                    help="all=306 ch (unambiguous default); mag/grad need verified ordering")
@@ -82,7 +85,7 @@ def load_data(args):
         return load_hcp_motor(subject=args.subject, hcp_path=args.hcp_path,
                               classes=tuple(args.classes),
                               tmin=config.DEFAULT_TMIN, tmax=config.DEFAULT_TMAX)
-    else:  # yeom
+    elif args.source == "yeom":
         from loaders.yeom import load_yeom
         # --classes defaults to the synthetic/hcp class set; for yeom let the
         # loader use its 4-direction default unless the user overrode it.
@@ -93,6 +96,16 @@ def load_data(args):
                          classes=yeom_classes,
                          crop=tuple(args.crop) if args.crop else None,
                          resample=args.resample, align=args.align, onset_k=args.onset_k)
+    else:  # rathee (MEG motor/cognitive imagery; BIDS .fif)
+        from loaders.rathee import load_rathee
+        # default to all 4 imagery classes unless the user overrode --classes
+        rathee_classes = (None if list(args.classes) == list(config.DEFAULT_CLASSES)
+                          else tuple(args.classes))
+        tmin, tmax = (args.crop if args.crop else (0.5, 3.5))   # imagery window (s)
+        return load_rathee(bids_root=args.rathee_path, subject=args.subject,
+                           session=(args.session or "1"), sensor_type=args.sensor_type,
+                           classes=rathee_classes, tmin=tmin, tmax=tmax,
+                           resample=args.resample)
 
 
 def main():

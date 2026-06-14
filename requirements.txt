@@ -11,6 +11,9 @@ torch
 # v7.3/HDF5 .mat files (loader auto-falls back to it):
 mat73
 
+# Rathee MEG-imagery branch (loaders/rathee.py): BIDS .fif via MNE + mne-bids:
+mne-bids
+
 # Real HCP-data branch only (loaders/hcp.py):
 mne-hcp          # provides the importable `hcp` module
 boto3            # for scripted S3 download (or use the AWS CLI instead)
