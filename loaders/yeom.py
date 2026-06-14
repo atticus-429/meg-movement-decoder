@@ -156,6 +156,18 @@ def _accel_indices(mat):
     return np.array(idx) if idx else None
 
 
+def _eog_indices(mat):
+    """Indices of the EOG (eye) channels (by name), or None. Used as a gaze/ocular
+    confound control: decoding direction from EOG alone reveals whether a 'neural'
+    pre-movement direction signal is actually eye movement toward the target."""
+    info = _info_dict(mat)
+    ch_names = info.get("ch_names") if isinstance(info, dict) else getattr(info, "ch_names", None)
+    if not ch_names:
+        return None
+    idx = [i for i, n in enumerate(ch_names) if "eog" in str(n).lower()]
+    return np.array(idx) if idx else None
+
+
 def _detect_movement_onset(accel, sfreq, tmin, k=4.0, min_dur=0.03, search_start=0.0):
     """Per-trial movement onset (sample index) from a (n_axes, T) accelerometer trace.
     Detrend each axis by the pre-cue baseline (removes the gravity offset), take the
@@ -216,13 +228,19 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
         raise RuntimeError(f"direction cells disagree on channels/time: {shapes}")
 
     # channel selection: prefer the MNE info ch_names (authoritative), else positional
-    chan = None if mag_idx is not None else _meg_channel_index(mat)
-    if chan is not None:
-        if sensor_type not in chan:
-            raise ValueError(f"sensor_type must be all/mag/grad, got {sensor_type!r}")
-        sel, sel_src = chan[sensor_type], "info"
+    if sensor_type == "eog":                         # gaze/ocular confound control
+        eog = _eog_indices(mat)
+        if eog is None:
+            raise RuntimeError("sensor_type='eog' but no EOG channels in info ch_names")
+        sel, sel_src = eog, "eog"
     else:
-        sel, sel_src = _sensor_indices(sensor_type, n_meg, mag_idx), "positional"
+        chan = None if mag_idx is not None else _meg_channel_index(mat)
+        if chan is not None:
+            if sensor_type not in chan:
+                raise ValueError(f"sensor_type must be all/mag/grad/eog, got {sensor_type!r}")
+            sel, sel_src = chan[sensor_type], "info"
+        else:
+            sel, sel_src = _sensor_indices(sensor_type, n_meg, mag_idx), "positional"
 
     # sampling rate: prefer the value stored in the file's info
     isf = _info_sfreq(mat)
