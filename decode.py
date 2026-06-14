@@ -303,6 +303,57 @@ class TorchConvTransformer(BaseEstimator, ClassifierMixin):
             y_b = y[perm]
         return x, y_a, y_b, lam
 
+    def _run_training(self, xb, yb, xb_all, yb_all, va, weight, lossf,
+                      opt, sched, n_epochs, augment=True):
+        """Shared minibatch training loop for fit() (pretrain) and finetune()
+        (calibrate). Trains net_ in place for n_epochs; if `va` is given, tracks
+        held-out val loss and restores the best weights (early stopping)."""
+        import torch
+        n = len(yb)
+        rng = np.random.default_rng(self.seed)
+        g = torch.Generator(device=self.device_)
+        g.manual_seed(int(self.seed))
+        best_val, best_state, bad = np.inf, None, 0
+        for epoch in range(n_epochs):
+            self.net_.train()
+            perm = rng.permutation(n)
+            for s in range(0, n, self.batch_size):
+                idx = perm[s:s + self.batch_size]
+                xbatch = xb[idx].to(self.device_)
+                ybatch = yb[idx].to(self.device_)
+                if augment:
+                    xbatch, y_a, y_b, lam = self._augment(xbatch, ybatch, g)
+                else:
+                    y_a, y_b, lam = ybatch, ybatch, None
+                opt.zero_grad()
+                out = self.net_(xbatch)
+                if lam is None:
+                    loss = lossf(out, y_a)
+                else:
+                    loss = lam * lossf(out, y_a) + (1.0 - lam) * lossf(out, y_b)
+                loss.backward()
+                opt.step()
+                if sched is not None:
+                    sched.step()
+            # early stopping on held-out val loss (keep best weights)
+            if va is not None and (epoch + 1) >= self.min_epochs:
+                self.net_.eval()
+                with torch.no_grad():
+                    vout = self.net_(xb_all[va].to(self.device_))
+                    vloss = torch.nn.functional.cross_entropy(
+                        vout, yb_all[va].to(self.device_), weight=weight,
+                        label_smoothing=self.label_smoothing).item()
+                if vloss < best_val - 1e-4:
+                    best_val, bad = vloss, 0
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in self.net_.state_dict().items()}
+                else:
+                    bad += 1
+                    if bad >= self.patience:
+                        break
+        if best_state is not None:
+            self.net_.load_state_dict(best_state)
+
     def fit(self, X, y):
         import torch
         torch.manual_seed(self.seed)
@@ -368,46 +419,77 @@ class TorchConvTransformer(BaseEstimator, ClassifierMixin):
         else:
             sched = None
 
-        rng = np.random.default_rng(self.seed)
-        g = torch.Generator(device=self.device_)
-        g.manual_seed(int(self.seed))
-        best_val, best_state, bad = np.inf, None, 0
-        for epoch in range(self.n_epochs):
-            self.net_.train()
-            perm = rng.permutation(n)
-            for s in range(0, n, self.batch_size):
-                idx = perm[s:s + self.batch_size]
-                xbatch = xb[idx].to(self.device_)
-                ybatch = yb[idx].to(self.device_)
-                xbatch, y_a, y_b, lam = self._augment(xbatch, ybatch, g)
-                opt.zero_grad()
-                out = self.net_(xbatch)
-                if lam is None:
-                    loss = lossf(out, y_a)
-                else:
-                    loss = lam * lossf(out, y_a) + (1.0 - lam) * lossf(out, y_b)
-                loss.backward()
-                opt.step()
-                if sched is not None:
-                    sched.step()
-            # early stopping on held-out val loss (keep best weights)
-            if va is not None and (epoch + 1) >= self.min_epochs:
-                self.net_.eval()
-                with torch.no_grad():
-                    vout = self.net_(xb_all[va].to(self.device_))
-                    vloss = torch.nn.functional.cross_entropy(
-                        vout, yb_all[va].to(self.device_), weight=weight,
-                        label_smoothing=self.label_smoothing).item()
-                if vloss < best_val - 1e-4:
-                    best_val, bad = vloss, 0
-                    best_state = {k: v.detach().cpu().clone()
-                                  for k, v in self.net_.state_dict().items()}
-                else:
-                    bad += 1
-                    if bad >= self.patience:
-                        break
-        if best_state is not None:
-            self.net_.load_state_dict(best_state)
+        self._run_training(xb, yb, xb_all, yb_all, va, weight, lossf,
+                           opt, sched, self.n_epochs, augment=True)
+        return self
+
+    def finetune(self, X, y, lr=1e-4, n_epochs=30, freeze_trunk=False,
+                 restandardize=True, augment=False):
+        """Calibrate a PRETRAINED model on a small target-subject dataset.
+        Requires fit() first (Tier-2 cross-subject transfer):
+          - freeze_trunk=False -> fine-tune ALL weights (flavor A)
+          - freeze_trunk=True  -> train only the input adapter (spatial) + pool
+            query + classifier head, trunk frozen (flavor C)
+        Re-standardizes per-channel on the target by default (a parameter-free
+        subject adaptation). Trains on ALL of (X, y) -- no val split, since
+        calibration data is scarce. Returns self."""
+        import torch
+        if not hasattr(self, "net_"):
+            raise RuntimeError("finetune() requires a pretrained model; call fit() first")
+        unknown = set(np.unique(y).tolist()) - set(self.classes_.tolist())
+        if unknown:
+            raise ValueError(f"finetune labels {unknown} not in pretrained "
+                             f"classes {self.classes_.tolist()}")
+        y_idx = np.searchsorted(self.classes_, y)
+        n_classes = len(self.classes_)
+
+        # parameter-free subject adaptation: re-standardize on the target
+        if restandardize:
+            self.mean_ = X.mean(axis=(0, 2), keepdims=True)
+            self.std_ = X.std(axis=(0, 2), keepdims=True) + 1e-6
+        Xn = ((X - self.mean_) / self.std_).astype(np.float32)
+        xb_all = torch.tensor(Xn)
+        yb_all = torch.tensor(y_idx, dtype=torch.long)
+
+        # reset any prior freeze, then optionally freeze the trunk
+        for p in self.net_.parameters():
+            p.requires_grad_(True)
+        if freeze_trunk:
+            for mod in (self.net_.proj_in, self.net_.blocks,
+                        self.net_.downsample, self.net_.transformer):
+                for p in mod.parameters():
+                    p.requires_grad_(False)
+
+        if self.class_weight:
+            counts = np.bincount(yb_all.numpy(), minlength=n_classes).astype(np.float32)
+            w = counts.sum() / (n_classes * np.maximum(counts, 1.0))
+            weight = torch.tensor(w, dtype=torch.float32, device=self.device_)
+        else:
+            weight = None
+        lossf = torch.nn.CrossEntropyLoss(weight=weight,
+                                          label_smoothing=self.label_smoothing)
+        params = [p for p in self.net_.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(params, lr=lr, weight_decay=self.weight_decay)
+
+        n = len(yb_all)
+        steps_per_epoch = max(1, (n + self.batch_size - 1) // self.batch_size)
+        total_steps = steps_per_epoch * n_epochs
+        if self.lr_schedule == "cosine":
+            warmup = max(1, int(self.warmup_frac * total_steps))
+
+            def lr_lambda(step):
+                if step < warmup:
+                    return (step + 1) / warmup
+                prog = (step - warmup) / max(1, total_steps - warmup)
+                return float(0.5 * (1.0 + np.cos(np.pi * min(prog, 1.0))))
+
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+        else:
+            sched = None
+
+        # calibrate on all target trials (va=None -> no early stopping)
+        self._run_training(xb_all, yb_all, xb_all, yb_all, None, weight, lossf,
+                           opt, sched, n_epochs, augment=augment)
         return self
 
     def predict(self, X):
