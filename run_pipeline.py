@@ -41,7 +41,7 @@ def parse_args():
     p.add_argument("--source", choices=["synthetic", "hcp", "yeom", "rathee"],
                    default="synthetic")
     p.add_argument("--decoder",
-                   choices=["csp", "bandpower", "eegnet", "convtransformer"],
+                   choices=["csp", "bandpower", "eegnet", "convtransformer", "tdlinear"],
                    default="csp")
     p.add_argument("--cv", choices=["kfold", "holdout"], default="kfold",
                    help="kfold = 5-fold CV; holdout = single split (torch trains once)")
@@ -66,6 +66,9 @@ def parse_args():
     p.add_argument("--crop", nargs=2, type=float, default=None,
                    metavar=("LO", "HI"), help="crop window in seconds")
     p.add_argument("--resample", type=float, default=None, help="downsample to this Hz")
+    p.add_argument("--band", nargs="+", type=float, default=None, metavar="HZ",
+                   help="low-pass <H (one value) or band-pass L H (two values), "
+                        "applied to full epochs before windowing (yeom source)")
     p.add_argument("--align", choices=["cue", "movement"], default="cue",
                    help="cue=fixed window from cue onset; movement=accel-gated pre-movement window")
     p.add_argument("--onset-k", type=float, default=4.0,
@@ -95,11 +98,15 @@ def load_data(args):
         # loader use its 4-direction default unless the user overrode it.
         yeom_classes = (None if list(args.classes) == list(config.DEFAULT_CLASSES)
                         else tuple(args.classes))
+        band = None
+        if args.band:
+            band = args.band[0] if len(args.band) == 1 else tuple(args.band[:2])
         return load_yeom(data_path=args.yeom_path, subject=args.subject,
                          session=args.session, sensor_type=args.sensor_type,
                          classes=yeom_classes,
                          crop=tuple(args.crop) if args.crop else None,
-                         resample=args.resample, align=args.align, onset_k=args.onset_k)
+                         resample=args.resample, align=args.align, onset_k=args.onset_k,
+                         band=band)
     else:  # rathee (MEG motor/cognitive imagery; BIDS .fif)
         from loaders.rathee import load_rathee
         # default to all 4 imagery classes unless the user overrode --classes

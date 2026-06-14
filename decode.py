@@ -40,6 +40,15 @@ class BandPass(BaseEstimator, TransformerMixin):
         return bandpass(X, self.sfreq, self.l_freq, self.h_freq, self.order)
 
 
+class Flatten(BaseEstimator, TransformerMixin):
+    """(trials, channels, times) -> (trials, channels*times) for linear models."""
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return np.asarray(X).reshape(len(X), -1)
+
+
 class BandPowerFeatures(BaseEstimator, TransformerMixin):
     def __init__(self, sfreq=250.0, bands=((8, 13), (13, 30)), order=4):
         self.sfreq = sfreq
@@ -532,5 +541,14 @@ def build_decoder(name, sfreq, beta_band=(13.0, 30.0), mu_band=(8.0, 13.0),
         return TorchEEGNet(sfreq=sfreq)
     if name == "convtransformer":
         return TorchConvTransformer(sfreq=sfreq, **kwargs)
-    raise ValueError(f"unknown decoder '{name}' "
-                     f"(choose csp / bandpower / eegnet / convtransformer)")
+    if name == "tdlinear":
+        # low-frequency time-domain -> L2 logistic (Waldert-style: the literature's
+        # recipe for slow-potential direction decoding; pair with band= low-pass in
+        # the loader). Logistic (not LDA) to avoid a features^2 covariance blow-up.
+        return make_pipeline(
+            Flatten(),
+            StandardScaler(),
+            LogisticRegression(C=0.1, max_iter=5000),
+        )
+    raise ValueError(f"unknown decoder '{name}' (choose csp / bandpower / "
+                     f"eegnet / convtransformer / tdlinear)")

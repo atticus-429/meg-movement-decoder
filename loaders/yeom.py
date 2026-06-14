@@ -30,10 +30,32 @@ import os
 import glob
 import numpy as np
 import scipy.io
-from scipy.signal import resample_poly
+from scipy.signal import resample_poly, butter, sosfiltfilt
 from fractions import Fraction
 
 ALL_DIRS = ["dir0", "dir1", "dir2", "dir3"]   # 4 reach directions (semantics TBD)
+
+
+def _bandfilter(x, sfreq, band, order=4):
+    """Zero-phase Butterworth filter along the TIME axis (axis=1) of an
+    (channels, time, trials) array, applied to the FULL epoch (before windowing,
+    so a low-frequency filter has no short-window edge artifacts).
+      band = h (scalar)   -> low-pass < h Hz
+      band = (l, h)       -> band-pass l..h Hz (l=None -> low-pass < h)
+    Returns the same dtype. Motivated by the pre-movement literature: the
+    directional signal lives in slow (<~7 Hz, esp. 0.1-3 Hz SCP) time-domain
+    potentials; band power gives ~chance (Waldert 2008)."""
+    if band is None:
+        return x
+    if np.isscalar(band):
+        sos = butter(order, float(band), btype="low", fs=sfreq, output="sos")
+    else:
+        lo, hi = band
+        if lo is None:
+            sos = butter(order, float(hi), btype="low", fs=sfreq, output="sos")
+        else:
+            sos = butter(order, [float(lo), float(hi)], btype="band", fs=sfreq, output="sos")
+    return sosfiltfilt(sos, x, axis=1).astype(x.dtype, copy=False)
 
 
 def _load_mat(path):
@@ -160,7 +182,7 @@ def _detect_movement_onset(accel, sfreq, tmin, k=4.0, min_dur=0.03, search_start
 def load_yeom(data_path, subject=None, session=None, sensor_type="all",
               classes=None, tmin=-1.0, tmax=2.0, crop=None, resample=None,
               n_meg=306, mag_idx=None, sfreq=600.615, seed=0,
-              align="cue", onset_k=4.0):
+              align="cue", onset_k=4.0, band=None):
     # --- resolve the .mat file -------------------------------------------------
     if os.path.isdir(data_path):
         # recursive so zip-extracted nested folders (e.g. on Colab/Drive) are found
@@ -218,7 +240,8 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
         X_list, y_list, onset_s, n_drop = [], [], [], 0
         for new_label, d in enumerate(keep):
             cell = cells[d]                                # (319, T, n_trials)
-            meg, acc = cell[sel], cell[acc_idx]
+            # filter MEG on the FULL epoch before per-trial windowing; accel stays raw
+            meg, acc = _bandfilter(cell[sel], sfreq, band), cell[acc_idx]
             for tr in range(cell.shape[2]):
                 onset = _detect_movement_onset(acc[:, :, tr], sfreq, tmin, k=onset_k)
                 if onset is None or onset + w0 < 0 or onset + w1 > cell.shape[1]:
@@ -240,7 +263,7 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
         # --- cue-locked: single fixed window for every trial --------------------
         X_list, y_list = [], []
         for new_label, d in enumerate(keep):
-            arr = cells[d][sel]                          # select MEG channels (absolute idx)
+            arr = _bandfilter(cells[d][sel], sfreq, band)   # MEG, filtered on full epoch
             trials = np.transpose(arr, (2, 0, 1))        # -> (trials, channels, time)
             X_list.append(trials)
             y_list.append(np.full(trials.shape[0], new_label, dtype=int))
@@ -263,5 +286,5 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
     X, y = X[perm], y[perm]
 
     print(f"[yeom] {X.shape[0]} trials | {X.shape[1]} channels ({sensor_type}, {sel_src}) | "
-          f"{X.shape[2]} samples | sfreq={sfreq:.1f} Hz | classes {class_names}")
+          f"{X.shape[2]} samples | sfreq={sfreq:.1f} Hz | band={band} | classes {class_names}")
     return X, y, float(sfreq), class_names
