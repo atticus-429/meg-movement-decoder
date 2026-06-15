@@ -306,3 +306,89 @@ def load_yeom(data_path, subject=None, session=None, sensor_type="all",
     print(f"[yeom] {X.shape[0]} trials | {X.shape[1]} channels ({sensor_type}, {sel_src}) | "
           f"{X.shape[2]} samples | sfreq={sfreq:.1f} Hz | band={band} | classes {class_names}")
     return X, y, float(sfreq), class_names
+
+
+def load_full_epochs(data_path, subject=None, session=None, sensor_type="all",
+                     classes=None, tmin=-1.0, n_meg=306, mag_idx=None,
+                     sfreq=600.615, onset_k=4.0, seed=0):
+    """Causal-replay front-end for the pseudo-online harness (pseudo_online.py).
+
+    Returns the FULL broadband epoch for every trial -- NO band-filtering,
+    windowing, or resampling -- plus the per-trial accelerometer movement-onset
+    sample index and the cue sample index, so the harness can apply all three of
+    those operations CAUSALLY itself. (load_yeom does them ACAUSALLY: sosfiltfilt
+    over the full epoch + resample_poly + onset-relative windowing.)
+
+    Contract:
+      X (n_trials, n_channels, n_times) float32, y (n_trials,) int, sfreq (float),
+      onsets (n_trials,) int  -- accel movement-onset sample index into the time
+                                 axis, or -1 if no onset was detected,
+      cue_idx (int)           -- the cue (t=0) sample index = round(-tmin*sfreq),
+      class_names (list).
+    """
+    # --- resolve the .mat (same matching as load_yeom) ---
+    if os.path.isdir(data_path):
+        cands = sorted(glob.glob(os.path.join(data_path, "**", "*.mat"), recursive=True))
+        for tok in (subject, session):
+            if tok is not None:
+                cands = [f for f in cands if str(tok) in os.path.basename(f)]
+        if not cands:
+            raise FileNotFoundError(f"No matching .mat under {data_path} for "
+                                    f"subject={subject} session={session}")
+        path = cands[0]
+    else:
+        path = data_path
+    print(f"[yeom] (full-epoch) loading {os.path.basename(path)}")
+
+    mat = _load_mat(path)
+    key, cells = _find_direction_cells(mat)
+
+    if classes is None:
+        keep = list(range(4)); class_names = list(ALL_DIRS)
+    else:
+        keep = [ALL_DIRS.index(c) for c in classes]; class_names = list(classes)
+
+    # channel selection: prefer the MNE info ch_names (authoritative), else positional
+    chan = None if mag_idx is not None else _meg_channel_index(mat)
+    if chan is not None:
+        if sensor_type not in chan:
+            raise ValueError(f"sensor_type must be all/mag/grad, got {sensor_type!r}")
+        sel = chan[sensor_type]
+    else:
+        sel = _sensor_indices(sensor_type, n_meg, mag_idx)
+
+    isf = _info_sfreq(mat)
+    if isf is not None:
+        sfreq = isf
+    cue_idx = int(round(-tmin * sfreq))
+
+    acc_idx = _accel_indices(mat)
+    if acc_idx is None:
+        print("[yeom] WARNING: no accelerometer channels found; onsets set to -1 "
+              "(onset-anchored conditions will then have no trials).")
+
+    X_list, y_list, onsets = [], [], []
+    for new_label, d in enumerate(keep):
+        cell = np.asarray(cells[d])                  # (n_all_ch, time, trials)
+        meg = cell[sel]                              # broadband, unfiltered
+        acc = cell[acc_idx] if acc_idx is not None else None
+        for tr in range(cell.shape[2]):
+            X_list.append(meg[:, :, tr])
+            y_list.append(new_label)
+            if acc is not None:
+                on = _detect_movement_onset(acc[:, :, tr], sfreq, tmin, k=onset_k)
+                onsets.append(int(on) if on is not None else -1)
+            else:
+                onsets.append(-1)
+
+    X = np.stack(X_list).astype(np.float32)
+    y = np.array(y_list, dtype=int)
+    onsets = np.array(onsets, dtype=int)
+    perm = np.random.default_rng(seed).permutation(len(y))
+    X, y, onsets = X[perm], y[perm], onsets[perm]
+
+    n_det = int((onsets >= 0).sum())
+    print(f"[yeom] full epochs: {X.shape[0]} trials | {X.shape[1]} ch ({sensor_type}) | "
+          f"{X.shape[2]} samp | sfreq={sfreq:.1f} Hz | cue@{cue_idx} | "
+          f"onset detected {n_det}/{len(onsets)} | classes {class_names}")
+    return X, y, float(sfreq), onsets, cue_idx, class_names
