@@ -50,10 +50,11 @@ import numpy as np
 from scipy.signal import butter, sosfilt, sosfiltfilt, resample_poly
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 
-from decode import build_decoder, Flatten
+from decode import Flatten
 from evaluate import bootstrap_error_ci
 
 # Grid mirrors §12 (Low-frequency / late-window PRE test).
@@ -70,6 +71,11 @@ CONDITIONS = [
     dict(name="causal-onset", filt="causal",  anchor="onset", scale="channel", resamp="causal"),
     dict(name="causal-cue",   filt="causal",  anchor="cue",   scale="channel", resamp="causal"),
 ]
+
+# Lowered from sklearn's 5000 ceiling: weak-signal cells otherwise grind to the
+# lbfgs iteration limit, which is the dominant runtime cost. C=0.1 (strong L2)
+# converges well under this; pass --max-iter 5000 to restore the exact §12 estimator.
+DEFAULT_MAX_ITER = 1000
 
 
 # --------------------------------------------------------------------------- #
@@ -89,13 +95,46 @@ class ChannelScaler(BaseEstimator, TransformerMixin):
         return (X - self.mean_) / self.std_
 
 
-def _estimator(scale, sfreq):
-    """The tdlinear estimator with the requested normalisation. 'feature' is the
-    stock build_decoder('tdlinear') (Flatten -> StandardScaler -> L2 logistic)."""
+def _plsda(k):
+    """Supervised PLS-DA reducer (one-hot y -> PLSRegression -> X-scores) used as the
+    manifold bottleneck. Imported lazily from the neural_manifold_learning branch so
+    the default `direct` arm carries no dependency on that sibling tree; if the branch
+    is absent the manifold arm raises a clear error rather than failing at import."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "neural_manifold_learning"))
+        from reducers import PLSDATransformer
+    except Exception as e:                                   # pragma: no cover
+        raise ImportError(
+            "manifold decoder needs neural_manifold_learning/reducers.py "
+            f"(PLSDATransformer); not importable: {e}")
+    return PLSDATransformer(n_components=k)
+
+
+def _estimator(scale, sfreq, max_iter=DEFAULT_MAX_ITER, decoder="direct", k=16):
+    """The pre-movement estimator with the requested normalisation and decoder arm.
+
+    decoder='direct' replicates build_decoder('tdlinear') (a flat L2 logistic over all
+    channel x time features). decoder='manifold' inserts a supervised PLS-DA bottleneck
+    of dimension k between the scaled features and the SAME logistic head, so the only
+    difference is the low-dim projection -- the manifold arm decodes X -> z (k dims) -> y
+    while direct decodes X -> y over the full ~ch*t feature space. Both heads share
+    C=0.1 so the comparison isolates the bottleneck, not the regulariser.
+
+    'feature' scaling = per (channel x timepoint) z-score (Flatten -> StandardScaler,
+    the §12 acausal template); 'channel' = per-channel z-score (online-faithful, no
+    per-timepoint template). The PLS reducer centres internally, so the channel arm
+    keeps its template-free property (no StandardScaler inserted). max_iter caps lbfgs;
+    sfreq is accepted for signature symmetry."""
+    clf = LogisticRegression(C=0.1, max_iter=max_iter)
     if scale == "feature":
-        return build_decoder("tdlinear", sfreq=sfreq)
-    return make_pipeline(ChannelScaler(), Flatten(),
-                         LogisticRegression(C=0.1, max_iter=5000))
+        steps = [Flatten(), StandardScaler()]
+    else:
+        steps = [ChannelScaler(), Flatten()]
+    if decoder == "manifold":
+        steps.append(_plsda(k))
+    steps.append(clf)
+    return make_pipeline(*steps)
 
 
 # --------------------------------------------------------------------------- #
@@ -184,7 +223,8 @@ def causal_lag_ms(sfreq, band):
 # one condition x band x window -> accuracy + 95% CI
 # --------------------------------------------------------------------------- #
 def run_cell(X_full, y, sfreq, onsets, cue_idx, cond, band, win,
-             target_fs=50.0, folds=5, seed=0):
+             target_fs=50.0, folds=5, seed=0, max_iter=DEFAULT_MAX_ITER, n_jobs=1,
+             decoder="direct", k=16):
     Xf = _filter_full(X_full, sfreq, band, causal=(cond["filt"] == "causal"))
     Xw, yw = _window(Xf, sfreq, win, cond["anchor"], onsets, cue_idx, y)
     Xd, fs_d = _decimate(Xw, sfreq, target_fs, band, causal=(cond["resamp"] == "causal"))
@@ -196,15 +236,16 @@ def run_cell(X_full, y, sfreq, onsets, cue_idx, cond, band, win,
                     n=len(yw), nfold=0)
     nfold = int(min(folds, nz.min()))
     cv = StratifiedKFold(n_splits=nfold, shuffle=True, random_state=seed)
-    est = _estimator(cond["scale"], fs_d)
-    y_pred = cross_val_predict(est, Xd, yw, cv=cv, n_jobs=1)
+    est = _estimator(cond["scale"], fs_d, max_iter, decoder=decoder, k=k)
+    y_pred = cross_val_predict(est, Xd, yw, cv=cv, n_jobs=n_jobs)
     err, lo, hi = bootstrap_error_ci(yw, y_pred, seed=seed)
     return dict(acc=100 * (1 - err), lo=100 * (1 - hi), hi=100 * (1 - lo),
                 n=len(yw), nfold=nfold)
 
 
 def run_grid(X_full, y, sfreq, onsets, cue_idx, class_names,
-             target_fs=50.0, folds=5, seed=0, bands=None):
+             target_fs=50.0, folds=5, seed=0, bands=None,
+             max_iter=DEFAULT_MAX_ITER, n_jobs=1, decoder="direct", k=16):
     bands = BANDS if bands is None else bands
     chance = 100.0 / len(class_names)
 
@@ -218,7 +259,8 @@ def run_grid(X_full, y, sfreq, onsets, cue_idx, class_names,
         for band in bands:
             for win in wins:
                 r = run_cell(X_full, y, sfreq, onsets, cue_idx, cond, band, win,
-                             target_fs=target_fs, folds=folds, seed=seed)
+                             target_fs=target_fs, folds=folds, seed=seed,
+                             max_iter=max_iter, n_jobs=n_jobs, decoder=decoder, k=k)
                 r.update(cond=cond["name"], band=_bstr(band),
                          win=f"{win[0]:+.2f}..{win[1]:+.2f}")
                 rows.append(r)
@@ -302,8 +344,17 @@ def _extract(Xf, sfreq, win, anchor, onsets, cue_idx, idx):
     return np.stack(segs).astype(np.float32)
 
 
+def _inner_score(scale, fs_d, Xtr, ytr, inner, max_iter, decoder="direct", k=16):
+    """Inner-CV accuracy of one band x window candidate on the calibration trials.
+    Top-level (not a closure) so it is picklable for joblib parallelism."""
+    est = _estimator(scale, fs_d, max_iter, decoder=decoder, k=k)
+    yhat = cross_val_predict(est, Xtr, ytr, cv=inner, n_jobs=1)
+    return float(np.mean(yhat == ytr))
+
+
 def run_condition_nested(X_full, y, sfreq, onsets, cue_idx, cond, bands,
-                         target_fs, k_outer, k_inner, seed):
+                         target_fs, k_outer, k_inner, seed,
+                         max_iter=DEFAULT_MAX_ITER, n_jobs=1, decoder="direct", k=16):
     """Nested CV for one condition. Outer folds give held-out test predictions;
     for each outer fold an inner CV over the band x window grid (on outer-train
     ONLY) picks the combo, which is locked and refit on all outer-train before
@@ -342,17 +393,20 @@ def run_condition_nested(X_full, y, sfreq, onsets, cue_idx, cond, bands,
         nz_in = np.bincount(ytr); nz_in = nz_in[nz_in > 0]
         kin = max(2, min(k_inner, int(nz_in.min())))
         inner = StratifiedKFold(n_splits=kin, shuffle=True, random_state=seed)
-        best, best_acc = candidates[0], -1.0
-        for (b, w) in candidates:
-            Xc, fs_d = feats[(b, w)]
-            est = _estimator(cond["scale"], fs_d)
-            yhat = cross_val_predict(est, Xc[tr], ytr, cv=inner, n_jobs=1)
-            acc = float(np.mean(yhat == ytr))
-            if acc > best_acc:
-                best_acc, best = acc, (b, w)
-        b, w = best                                  # locked on calibration only
+        # inner grid scan over candidates (calibration trials only)
+        if n_jobs == 1:
+            accs = [_inner_score(cond["scale"], feats[(b, w)][1], feats[(b, w)][0][tr],
+                                 ytr, inner, max_iter, decoder, k) for (b, w) in candidates]
+        else:
+            from joblib import Parallel, delayed
+            accs = Parallel(n_jobs=n_jobs, inner_max_num_threads=1)(
+                delayed(_inner_score)(cond["scale"], feats[(b, w)][1],
+                                      feats[(b, w)][0][tr], ytr, inner, max_iter, decoder, k)
+                for (b, w) in candidates)
+        best = candidates[int(np.argmax(accs))]      # locked on calibration only
+        b, w = best
         Xc, fs_d = feats[(b, w)]
-        est = _estimator(cond["scale"], fs_d)
+        est = _estimator(cond["scale"], fs_d, max_iter, decoder=decoder, k=k)
         est.fit(Xc[tr], ytr)
         y_pred[te] = est.predict(Xc[te])
         picks.append(best)
@@ -368,7 +422,8 @@ def _pick_str(picks):
 
 
 def run_nested(X_full, y, sfreq, onsets, cue_idx, class_names,
-               target_fs=50.0, k_outer=5, k_inner=4, seed=0, bands=None):
+               target_fs=50.0, k_outer=5, k_inner=4, seed=0, bands=None,
+               max_iter=DEFAULT_MAX_ITER, n_jobs=1, decoder="direct", k=16):
     bands = BANDS if bands is None else bands
     chance = 100.0 / len(class_names)
     print(f"\nCausal-filter lag (how far the causal filter trails real time):")
@@ -377,11 +432,13 @@ def run_nested(X_full, y, sfreq, onsets, cue_idx, class_names,
 
     print(f"\n=== NESTED-CV (select band x window on calibration folds, lock, decode test) ===")
     print(f"chance = {chance:.1f}%   |   {k_outer}x outer, {k_inner}x inner "
-          f"over {len(bands)} bands x windows")
+          f"over {len(bands)} bands x windows   |   max_iter={max_iter}  jobs={n_jobs}"
+          f"  decoder={decoder}" + (f" k={k}" if decoder == "manifold" else ""))
     res = {}
     for cond in CONDITIONS:
         r = run_condition_nested(X_full, y, sfreq, onsets, cue_idx, cond, bands,
-                                 target_fs, k_outer, k_inner, seed)
+                                 target_fs, k_outer, k_inner, seed,
+                                 max_iter=max_iter, n_jobs=n_jobs, decoder=decoder, k=k)
         res[cond["name"]] = r
         if r is None:
             print(f"  {cond['name']:13s}   (too few trials)")
@@ -464,6 +521,15 @@ def smoke():
     # nested is never higher than the grid ceiling (no winner's-curse inflation)
     assert res["offline"]["acc"] <= best["offline"] + 1e-6, \
         f"nested {res['offline']['acc']:.1f} > grid ceiling {best['offline']:.1f}"
+
+    # ---- parallel path must match serial EXACTLY (determinism across n_jobs) ----
+    off = [c for c in CONDITIONS if c["name"] == "offline"][0]
+    r1 = run_condition_nested(X, y, sfreq, onsets, cue, off, BANDS, 50.0, 5, 4, 0,
+                              max_iter=DEFAULT_MAX_ITER, n_jobs=1)
+    r4 = run_condition_nested(X, y, sfreq, onsets, cue, off, BANDS, 50.0, 5, 4, 0,
+                              max_iter=DEFAULT_MAX_ITER, n_jobs=4)
+    assert abs(r1["acc"] - r4["acc"]) < 1e-9, (r1["acc"], r4["acc"])
+    print(f"[parallel check] n_jobs 1 vs 4 -> {r1['acc']:.1f}% == {r4['acc']:.1f}%")
     print("\nSMOKE OK")
 
 
@@ -484,6 +550,17 @@ def main():
     p.add_argument("--folds", type=int, default=5, help="grid protocol: CV folds")
     p.add_argument("--k-outer", type=int, default=5, help="nested protocol: outer folds")
     p.add_argument("--k-inner", type=int, default=4, help="nested protocol: inner folds")
+    p.add_argument("--max-iter", type=int, default=DEFAULT_MAX_ITER,
+                   help="logistic-regression lbfgs cap (lower = faster on weak-signal "
+                        "cells; pass 5000 for the exact §12 estimator)")
+    p.add_argument("--jobs", type=int, default=1,
+                   help="parallel workers over the band x window grid (BLAS pinned to "
+                        "1 thread/worker to avoid oversubscription; 1 = serial)")
+    p.add_argument("--decoder", choices=["direct", "manifold"], default="direct",
+                   help="direct = flat L2 logistic over all features (tdlinear); "
+                        "manifold = PLS-DA bottleneck (dim --k) before the same head")
+    p.add_argument("--k", type=int, default=16,
+                   help="manifold latent dimension (PLS-DA components); ignored for direct")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default=None, help="optional .csv path to save results")
     args = p.parse_args()
@@ -502,7 +579,9 @@ def main():
     import csv
     if args.protocol == "nested":
         res = run_nested(X, y, sfreq, onsets, cue, names, target_fs=args.target_fs,
-                         k_outer=args.k_outer, k_inner=args.k_inner, seed=args.seed)
+                         k_outer=args.k_outer, k_inner=args.k_inner, seed=args.seed,
+                         max_iter=args.max_iter, n_jobs=args.jobs,
+                         decoder=args.decoder, k=args.k)
         if args.out:
             with open(args.out, "w", newline="") as f:
                 w = csv.writer(f)
@@ -515,7 +594,9 @@ def main():
             print(f"saved {args.out}")
     else:
         rows = run_grid(X, y, sfreq, onsets, cue, names,
-                        target_fs=args.target_fs, folds=args.folds, seed=args.seed)
+                        target_fs=args.target_fs, folds=args.folds, seed=args.seed,
+                        max_iter=args.max_iter, n_jobs=args.jobs,
+                        decoder=args.decoder, k=args.k)
         if args.out:
             with open(args.out, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=["cond", "band", "win", "acc", "lo", "hi", "n", "nfold"])
